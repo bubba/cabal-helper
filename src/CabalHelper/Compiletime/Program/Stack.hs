@@ -24,44 +24,50 @@ License     : GPL-3
 
 module CabalHelper.Compiletime.Program.Stack where
 
+import Control.Exception (handle, throwIO)
 import Control.Monad
+import Control.Monad.Trans.Maybe
+import Control.Monad.IO.Class
 import Data.Char
+import Data.Foldable
 import Data.List hiding (filter)
 import Data.String
 import Data.Maybe
 import Data.Function
+import Data.Version
+import System.Directory (findExecutable)
 import System.FilePath hiding ((<.>))
+import System.IO (hPutStrLn, stderr)
+import Text.Printf (printf)
+import Text.Show.Pretty
 import Prelude
 
-import qualified CabalHelper.Compiletime.Cabal as Cabal
+import CabalHelper.Compiletime.Cabal (findCabalFile)
 import CabalHelper.Compiletime.Types
 import CabalHelper.Compiletime.Types.RelativePath
+import CabalHelper.Shared.Common
 
 getUnit :: QueryEnvI c 'Stack -> CabalFile -> IO (Unit 'Stack)
-getUnit qe cabal_file@(CabalFile cabal_file_path) = do
+getUnit
+  qe@QueryEnv{qeProjLoc=ProjLocStackYaml stack_yaml}
+  cabal_file@(CabalFile cabal_file_path)
+  = do
+  let projdir = takeDirectory stack_yaml
   let pkgdir = takeDirectory cabal_file_path
   let pkg_name = dropExtension $ takeFileName cabal_file_path
   look <- paths qe pkgdir
-  let distdirv1 = look "dist-dir:"
+  let distdirv1_rel = look "dist-dir:"
   return $ Unit
     { uUnitId     = UnitId pkg_name
     , uPackageDir = pkgdir
     , uCabalFile  = cabal_file
-    , uDistDir    = DistDirLib distdirv1
+    , uDistDir    = DistDirLib $ pkgdir </> distdirv1_rel
     , uImpl       = UnitImplStack
     }
 
--- TODO: patch ghc/ghc-pkg program paths like in ghc-mod when using stack so
--- compilation logic works even if no system compiler is installed
-
-packageDistDir :: QueryEnvI c 'Stack -> FilePath -> IO FilePath
-packageDistDir qe pkgdir = do
-  look <- paths qe pkgdir
-  return $ look "dist-dir:"
-
 projPaths :: QueryEnvI c 'Stack -> IO StackProjPaths
-projPaths qe@QueryEnv {qeProjLoc=ProjLocStackDir projdir} = do
-  look <- paths qe projdir
+projPaths qe@QueryEnv {qeProjLoc=ProjLocStackYaml stack_yaml} = do
+  look <- paths qe $ takeDirectory stack_yaml
   return StackProjPaths
     { sppGlobalPkgDb = PackageDbDir $ look "global-pkg-db:"
     , sppSnapPkgDb   = PackageDbDir $ look "snapshot-pkg-db:"
@@ -69,42 +75,82 @@ projPaths qe@QueryEnv {qeProjLoc=ProjLocStackDir projdir} = do
     , sppCompExe     = look "compiler-exe:"
     }
 
-paths :: QueryEnvI c 'Stack
-      -> FilePath
-      -> IO (String -> FilePath)
-paths qe dir = do
-    out <- qeReadProcess qe (Just dir) (stackProgram $ qePrograms qe)
-      (workdirArg qe ++ [ "path" ]) ""
-    return $ \k -> let Just x = lookup k $ map split $ lines out in x
+paths :: QueryEnvI c 'Stack -> FilePath -> IO (String -> FilePath)
+paths qe@QueryEnv{qeProjLoc=ProjLocStackYaml stack_yaml} cwd
+  = do
+  out <- readStackCmd qe (Just cwd) $
+    workdirArg qe ++ [ "path", "--stack-yaml="++stack_yaml ]
+  return $ \k -> let Just x = lookup k $ map split $ lines out in x
   where
     split l = let (key, ' ' : val) = span (not . isSpace) l in (key, val)
 
-listPackageCabalFiles' :: QueryEnvI c 'Stack -> IO [CabalFile]
-listPackageCabalFiles' qe@QueryEnv{qeProjLoc=ProjLocStackDir projdir} = do
-  -- NOTE:AZ: this does not work, the output of "stack ide packages" goes to stderr.
-  out <- qeReadProcess qe (Just projdir) (stackProgram $ qePrograms qe)
-    [ "ide", "packages", "--cabal-files" ] ""
-  return $ map CabalFile $ lines out
-
 listPackageCabalFiles :: QueryEnvI c 'Stack -> IO [CabalFile]
-listPackageCabalFiles qe@QueryEnv{qeProjLoc=ProjLocStackDir projdir} = do
-  out <- qeReadProcess qe (Just projdir) (stackProgram $ qePrograms qe)
-      [ "query", "locals" ] ""
-  let packageDirs = catMaybes $ map getPath $ lines out
-  cabalFiles <- mapM Cabal.findCabalFile $ filter (/= "") $ lines $ concat packageDirs
-  return $ map CabalFile cabalFiles
-
-getPath :: String -> Maybe String
-getPath str = r
+listPackageCabalFiles qe@QueryEnv{qeProjLoc=ProjLocStackYaml stack_yaml}
+  = do
+  -- try `stack ide packages`, then `stack query locals`
+  -- or else fail
+  result <- handle ioerror $ asum [idePackages, queryLocals]
+  return result
   where
-    str' = dropWhile (==' ') str
-    r = if isPrefixOf "path: " str'
-    then Just (drop (length "path: ") str')
-    else Nothing
+    projdir = takeDirectory stack_yaml
+
+    idePackages = map CabalFile . lines <$> readStackCmd qe (Just projdir)
+      [ "ide", "packages", "--cabal-files", "--stdout" ]
+
+    -- fallback until --cabal-files becomes more widely available in stack
+    queryLocals = do
+      out <- qeReadProcess qe "" (Just projdir) (stackProgram $ qePrograms qe)
+	      [ "query", "locals" ]
+      let packageDirs = catMaybes $ map getPath $ lines out
+      x <- mapM findCabalFile $ filter (/= "") packageDirs
+      return (map CabalFile x)
+
+    getPath :: String -> Maybe String
+    getPath str = r
+      where
+        str' = dropWhile (==' ') str
+        r = if isPrefixOf "path: " str'
+        then Just (drop (length "path: ") str')
+        else Nothing
+
+    ioerror :: IOError -> IO a
+    ioerror ioe = (=<<) (fromMaybe (throwIO ioe)) $ runMaybeT $ do
+      stack_exe <- MaybeT $ findExecutable $ stackProgram $ qePrograms qe
+      stack_ver_str
+        <- liftIO $ trim <$> readStackCmd qe Nothing ["--numeric-version"]
+      stack_ver <- MaybeT $ return $ parseVerMay stack_ver_str
+      guard $ stack_ver < makeVersion [1,9,4]
+
+      let prog_cfg = ppShow $ qePrograms qe
+
+      liftIO $ hPutStrLn stderr $ printf
+        "\nerror: stack version too old!\
+        \\n\n\
+        \You have '%s' installed but cabal-helper needs at least\n\
+        \stack version 1.9.4+.\n\
+        \\n\
+        \FYI cabal-helper is using the following `stack` executable:\n\
+        \  %s\n\
+        \\n\
+        \Additional debugging info: QueryEnv qePrograms =\n\
+        \  %s\n" stack_ver_str stack_exe prog_cfg
+      mzero
 
 workdirArg :: QueryEnvI c 'Stack -> [String]
 workdirArg QueryEnv{qeDistDir=DistDirStack mworkdir} =
   maybeToList $ ("--work-dir="++) . unRelativePath <$> mworkdir
+
+doStackCmd :: (QueryEnvI c 'Stack -> CallProcessWithCwd a)
+           -> QueryEnvI c 'Stack -> Maybe FilePath -> [String] -> IO a
+doStackCmd procfn qe mcwd args =
+  let Programs{..} = qePrograms qe in
+  procfn qe mcwd stackProgram $ stackArgsBefore ++ args ++ stackArgsAfter
+
+readStackCmd :: QueryEnvI c 'Stack -> Maybe FilePath -> [String] -> IO String
+callStackCmd :: QueryEnvI c 'Stack -> Maybe FilePath -> [String] -> IO ()
+
+readStackCmd = doStackCmd (\qe -> qeReadProcess qe "")
+callStackCmd = doStackCmd qeCallProcess
 
 patchCompPrograms :: StackProjPaths -> CompPrograms -> CompPrograms
 patchCompPrograms StackProjPaths{sppCompExe} cprogs =

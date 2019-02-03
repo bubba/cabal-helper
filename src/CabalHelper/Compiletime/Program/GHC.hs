@@ -61,6 +61,7 @@ data GhcInvocation = GhcInvocation
     }
 
 newtype GhcVersion = GhcVersion { unGhcVersion :: Version }
+    deriving (Eq, Ord, Read, Show)
 
 showGhcVersion :: GhcVersion -> String
 showGhcVersion (GhcVersion v) = showVersion v
@@ -139,13 +140,16 @@ invokeGhc GhcInvocation {..} = do
         , "-o", giOutput
         ]
       , map ("-optP"++) giCPPOptions
-      , case giPackageSource of
-          GPSAmbient -> []
-          GPSPackageDBs dbs -> map ("-package-conf="++) $ unPackageDbDir <$> dbs
+      , if giHideAllPackages then ["-hide-all-packages"] else []
+      , let packageFlags = concatMap (\p -> ["-package", p]) giPackages in
+        case giPackageSource of
+          GPSAmbient -> packageFlags
+          GPSPackageDBs dbs -> concat
+            [ map ("-package-conf="++) $ unPackageDbDir <$> dbs
+            , packageFlags
+            ]
           GPSPackageEnv env -> [ "-package-env=" ++ unPackageEnvFile env ]
       , map ("-i"++) $ nub $ "" : giIncludeDirs
-      , if giHideAllPackages then ["-hide-all-packages"] else []
-      , concatMap (\p -> ["-package", p]) giPackages
       , giWarningFlags
       , ["--make"]
       , giInputs

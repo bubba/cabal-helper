@@ -65,6 +65,7 @@ module Distribution.Helper (
   -- * GADTs
   , DistDir(..)
   , ProjType(..)
+  , SProjType(..)
   , ProjLoc(..)
 
   , Programs(..)
@@ -89,13 +90,8 @@ module Distribution.Helper (
   -- * Managing @dist/@
   , prepare
   , writeAutogenFiles
-
-  -- * Reexports
-  , module Data.Functor.Apply
-  , module CabalHelper.Compiletime.Process
   ) where
 
-import CabalHelper.Compiletime.Process
 import Cabal.Plan hiding (Unit, UnitId, uDistDir)
 import Control.Applicative
 import Control.Monad
@@ -116,10 +112,9 @@ import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Version
 import Data.Function
-import Data.Functor.Apply
 import System.Clock as Clock
 import System.Environment
-import System.FilePath hiding ((<.>))
+import System.FilePath
 import System.Directory
 import System.Process
 import System.Posix.Types
@@ -133,6 +128,7 @@ import qualified CabalHelper.Compiletime.Program.GHC as GHC
 import qualified CabalHelper.Compiletime.Program.CabalInstall as CabalInstall
 import CabalHelper.Compiletime.Cabal
 import CabalHelper.Compiletime.Log
+import CabalHelper.Compiletime.Process
 import CabalHelper.Compiletime.Sandbox
 import CabalHelper.Compiletime.Types
 import CabalHelper.Compiletime.Types.RelativePath
@@ -191,8 +187,11 @@ mkQueryEnv
 mkQueryEnv projloc distdir = do
   cr <- newIORef $ QueryCache Nothing Map.empty
   return $ QueryEnv
-    { qeReadProcess = \mcwd exe args stdin ->
+    { qeReadProcess = \stdin mcwd exe args ->
         readCreateProcess (proc exe args){ cwd = mcwd } stdin
+    , qeCallProcess  = \mcwd exe args -> do
+        let ?verbose = False -- TODO: we should get this from env or something
+        callProcessStderr mcwd exe args
     , qePrograms     = defaultPrograms
     , qeCompPrograms = defaultCompPrograms
     , qeProjLoc      = projloc
@@ -205,14 +204,16 @@ projConf :: ProjLoc pt -> ProjConf pt
 projConf (ProjLocCabalFile cabal_file) =
    ProjConfV1 cabal_file
 projConf (ProjLocV2Dir projdir_path) =
+  projConf $ ProjLocV2File $ projdir_path </> "cabal.project"
+projConf (ProjLocV2File proj_file) =
   ProjConfV2
-    { pcV2CabalProjFile       = projdir_path </> "cabal.project"
-    , pcV2CabalProjLocalFile  = projdir_path </> "cabal.project.local"
-    , pcV2CabalProjFreezeFile = projdir_path </> "cabal.project.freeze"
+    { pcV2CabalProjFile       = proj_file
+    , pcV2CabalProjLocalFile  = proj_file <.> "local"
+    , pcV2CabalProjFreezeFile = proj_file <.> "freeze"
     }
-projConf (ProjLocStackDir projdir_path) =
+projConf (ProjLocStackYaml stack_yaml) =
   ProjConfStack
-    { pcStackYaml = projdir_path </> "stack.yaml" }
+    { pcStackYaml = stack_yaml }
 
 getProjConfModTime :: ProjConf pt -> IO ProjConfModTimes
 getProjConfModTime ProjConfV1{pcV1CabalFile} =
@@ -280,16 +281,13 @@ allUnits f = fmap f <$> (mapM unitInfo =<< projectUnits)
 
 getProjInfo :: QueryEnv pt -> IO (ProjInfo pt)
 getProjInfo qe@QueryEnv{..} = do
-  -- putStrLn $ "Helper.getProjInfo entered" -- AZ
   cache@QueryCache{qcProjInfo, qcUnitInfos} <- readIORef qeCacheRef
   proj_info <- checkUpdateProjInfo qe qcProjInfo
   let active_units = NonEmpty.toList $ piUnits proj_info
-  -- putStrLn $ "Helper.getProjInfo acive_units:" ++ show (map uDistDir active_units) -- AZ
   writeIORef qeCacheRef $ cache
     { qcProjInfo  = Just proj_info
     , qcUnitInfos = discardInactiveUnitInfos active_units qcUnitInfos
     }
-  -- putStrLn $ "Helper.getProjInfo qcUnitInfos:" ++ show (Map.keys $ discardInactiveUnitInfos active_units qcUnitInfos) -- AZ
   return proj_info
 
 checkUpdateProjInfo
@@ -313,13 +311,9 @@ checkUpdateProjInfo qe mproj_info = do
 
 getUnitInfo :: QueryEnv pt -> Unit pt -> IO UnitInfo
 getUnitInfo qe@QueryEnv{..} unit@Unit{uDistDir} = do
-  -- putStrLn $ "getUnitInfo:uDistDir=" ++ show uDistDir
   proj_info <- getProjInfo qe
   cache@QueryCache{qcUnitInfos} <- readIORef qeCacheRef
   let munit_info = Map.lookup uDistDir qcUnitInfos
-  -- case munit_info of
-  --   Just _ -> putStrLn $ "getUnitInfo:munit_info isJust"  -- AZ
-  --   Nothing -> putStrLn $ "getUnitInfo:munit_info isNothing" -- AZ
   unit_info <- checkUpdateUnitInfo qe proj_info unit munit_info
   writeIORef qeCacheRef $ cache
     { qcUnitInfos = Map.insert uDistDir unit_info qcUnitInfos }
@@ -332,22 +326,16 @@ checkUpdateUnitInfo
     -> Maybe UnitInfo
     -> IO UnitInfo
 checkUpdateUnitInfo qe proj_info unit munit_info = do
-  -- putStrLn $ "checkUpdateUnitInfo" -- AZ
   unit_mtimes <- getUnitModTimes unit
   case munit_info of
-    Nothing -> do
-      -- putStrLn $ "checkUpdateUnitInfo Nothing->reconf" -- AZ
-      reconf
+    Nothing -> reconf
     Just unit_info
       | uiModTimes unit_info /= unit_mtimes
-        -> do
-          -- putStrLn $ "checkUpdateUnitInfo Just->reconf:(uiModTimes unit_info, unit_mtimes)=" ++ show (uiModTimes unit_info, unit_mtimes) -- AZ
-          reconf
+        -> reconf
       | otherwise
         -> return unit_info
   where
     reconf = do
-      -- putStrLn $ "checkUpdateUnitInfo reconf" -- AZ
       reconfigureUnit qe unit
       helper <- getHelperExe proj_info qe
       readUnitInfo qe helper unit
@@ -372,29 +360,50 @@ shallowReconfigureProject QueryEnv
   , qeDistDir = DistDirV1 _distdirv1 } =
     return ()
 shallowReconfigureProject QueryEnv
-  { qeProjLoc = ProjLocV2Dir projdir
+  { qeProjLoc = ProjLocV2File projfile
   , qeDistDir = DistDirV2 _distdirv2, .. } = do
-    _ <- liftIO $ qeReadProcess (Just projdir) (cabalProgram qePrograms)
-           ["new-build", "--dry-run", "all"] ""
+    let projdir = takeDirectory projfile
+    _ <- qeCallProcess (Just projdir) (cabalProgram qePrograms)
+           ["new-build", "--dry-run", "--project-file="++projfile, "all"]
     return ()
 shallowReconfigureProject QueryEnv
-  { qeProjLoc = ProjLocStackDir _projdir, .. } = do
+  { qeProjLoc = ProjLocV2Dir projdir
+  , qeDistDir = DistDirV2 _distdirv2, .. } = do
+    _ <- qeCallProcess (Just projdir) (cabalProgram qePrograms)
+           ["new-build", "--dry-run", "all"]
+    return ()
+shallowReconfigureProject QueryEnv
+  { qeProjLoc = ProjLocStackYaml _stack_yaml, .. } = do
     -- -- In case we ever need to read the cabal files before the Unit stage, this command regenerates them from package.yaml
-    -- _ <- liftIO $ qeReadProcess (Just projdir) (stackProgram qePrograms)
+    -- _ <- liftIO $ qeCallProcess (Just projdir) (stackProgram qePrograms)
     --        ["build", "--dry-run"] ""
     return ()
 
 reconfigureUnit :: QueryEnvI c pt -> Unit pt -> IO ()
 reconfigureUnit QueryEnv{qeDistDir=DistDirV1{}, ..} Unit{uPackageDir=_} = do
   return ()
-reconfigureUnit QueryEnv{qeDistDir=DistDirV2{}, ..} Unit{uPackageDir, uImpl} = do
-  -- putStrLn $ "Helper.reconfigureUnit:(uPackageDir,uiV2Components uImpl)=" ++ show (uPackageDir,uiV2Components uImpl) -- AZ
-  _ <- liftIO $ qeReadProcess (Just uPackageDir) (cabalProgram qePrograms)
-        (["new-build"] ++ uiV2Components uImpl) ""
+reconfigureUnit
+  QueryEnv{qeProjLoc=ProjLocV2File projfile, ..}
+  Unit{uPackageDir, uImpl}
+  = do
+  _ <- qeCallProcess (Just uPackageDir) (cabalProgram qePrograms)
+        (["new-build", "--project-file="++projfile]
+         ++ uiV2Components uImpl)
   return ()
-reconfigureUnit QueryEnv{qeDistDir=DistDirStack{}, ..} Unit{uPackageDir} = do
-  _ <- liftIO $ qeReadProcess (Just uPackageDir) (stackProgram qePrograms)
-         [ "build", "--only-configure", "."] ""
+reconfigureUnit
+  QueryEnv{qeProjLoc=ProjLocV2Dir{}, ..}
+  Unit{uPackageDir, uImpl}
+  = do
+  _ <- qeCallProcess (Just uPackageDir) (cabalProgram qePrograms)
+        (["new-build"] ++ uiV2Components uImpl)
+        -- TODO: version check for --only-configure
+  return ()
+reconfigureUnit
+  qe@QueryEnv{qeProjLoc=ProjLocStackYaml stack_yaml, ..}
+  Unit{uPackageDir}
+  = do
+  _ <- Stack.callStackCmd qe (Just uPackageDir)
+         ["--stack-yaml="++stack_yaml, "build", "--only-configure", "."]
   return ()
 
 getFileModTime :: FilePath -> IO (FilePath, EpochTime)
@@ -405,11 +414,9 @@ getFileModTime f = do
 readProjInfo
     :: QueryEnvI c pt -> ProjConf pt -> ProjConfModTimes -> IO (ProjInfo pt)
 readProjInfo qe pc pcm = withVerbosity $ do
-  case (qeProjLoc qe, qeDistDir qe, pc) of
-    ((,,)
-     projloc
-     (DistDirV1 distdir)
-     ProjConfV1{pcV1CabalFile}) -> do
+  let projloc = qeProjLoc qe
+  case (qeDistDir qe, pc) of
+    (DistDirV1 distdir, ProjConfV1{pcV1CabalFile}) -> do
       let projdir = plV1Dir projloc
       setup_config_path <- canonicalizePath (distdir </> "setup-config")
       mhdr <- getCabalConfigHeader setup_config_path
@@ -429,7 +436,7 @@ readProjInfo qe pc pcm = withVerbosity $ do
               }
             , piImpl = ProjInfoV1
             }
-    (ProjLocV2Dir _projdir, DistDirV2 distdirv2, _) -> do
+    (DistDirV2 distdirv2, _) -> do
       let plan_path = distdirv2 </> "cache" </> "plan.json"
       plan_mtime <- modificationTime <$> getFileStatus plan_path
       plan@PlanJson { pjCabalLibVersion=Ver pjCabalLibVersion
@@ -447,26 +454,19 @@ readProjInfo qe pc pcm = withVerbosity $ do
           , piV2CompilerId = (Text.unpack compName, makeDataVersion compVer)
           }
         }
-    (ProjLocStackDir{} , DistDirStack{}, _) -> do
+    (DistDirStack{}, _) -> do
       Just cabal_files <- NonEmpty.nonEmpty <$> Stack.listPackageCabalFiles qe
       units <- mapM (Stack.getUnit qe) cabal_files
       proj_paths <- Stack.projPaths qe
-      cprogs <-
-        guessCompProgramPaths $
-        Stack.patchCompPrograms proj_paths $
-        qeCompPrograms qe
-      Just (cabalVer:_) <- runMaybeT $
-        let ?cprogs = cprogs in
-        let ?progs  = qePrograms qe in
+      let piImpl = ProjInfoStack { piStackProjPaths = proj_paths }
+      Just (cabalVer:_) <- withProgs piImpl qe $ runMaybeT $
         GHC.listCabalVersions (Just (sppGlobalPkgDb proj_paths))
         --  ^ See [Note Stack Cabal Version]
       return ProjInfo
         { piCabalVersion = cabalVer
         , piProjConfModTimes = pcm
         , piUnits = units
-        , piImpl = ProjInfoStack
-          { piStackProjPaths = proj_paths
-          }
+        , ..
         }
 
 readUnitInfo :: QueryEnvI c pt -> FilePath -> Unit pt -> IO UnitInfo
@@ -525,7 +525,7 @@ invokeHelper
   args0
   = do
     let args1 = cabal_file_path : distdir : args0
-    evaluate =<< qeReadProcess Nothing exe args1 "" `E.catch`
+    evaluate =<< qeReadProcess "" Nothing exe args1 `E.catch`
       \(_ :: E.IOException) ->
         panicIO $ concat
           ["invokeHelper", ": ", exe, " "
@@ -567,33 +567,6 @@ buildPlatform = display Distribution.System.buildPlatform
 lookupEnv' :: String -> IO (Maybe String)
 lookupEnv' k = lookup k <$> getEnvironment
 
--- | Determine ghc-pkg path from ghc path
-guessCompProgramPaths :: Verbose => CompPrograms -> IO CompPrograms
-guessCompProgramPaths progs = do
-    let v | ?verbose  = deafening
-          | otherwise = silent
-        mGhcPath0    | same ghcProgram progs dprogs = Nothing
-                     | otherwise = Just $ ghcProgram progs
-        mGhcPkgPath0 | same ghcPkgProgram progs dprogs = Nothing
-                     | otherwise = Just $ ghcPkgProgram progs
-    (_compiler, _mplatform, progdb)
-        <- GHC.configure
-               v
-               mGhcPath0
-               mGhcPkgPath0
-               ProgDb.defaultProgramDb
-    let getProg p = ProgDb.programPath <$> ProgDb.lookupProgram p progdb
-        mghcPath1    = getProg ProgDb.ghcProgram
-        mghcPkgPath1 = getProg ProgDb.ghcPkgProgram
-    return progs
-      { ghcProgram    = fromMaybe (ghcProgram progs) mghcPath1
-      , ghcPkgProgram = fromMaybe (ghcProgram progs) mghcPkgPath1
-      }
-
-  where
-   same f o o'  = f o == f o'
-   dprogs = defaultCompPrograms
-
 withVerbosity :: (Verbose => IO a) -> IO a
 withVerbosity act = do
   x <- lookup  "CABAL_HELPER_DEBUG" <$> getEnvironment
@@ -603,10 +576,47 @@ withVerbosity act = do
           _ -> False
   act
 
+-- | Bring 'Programs' and 'CompPrograms' into scope as implicit parameters
+withProgs
+    :: Verbose => ProjInfoImpl pt -> QueryEnvI c pt -> (Env => IO a) -> IO a
+withProgs impl QueryEnv{..} f = do
+  cprogs <- guessCompProgramPaths $ case impl of
+    ProjInfoStack projPaths ->
+      Stack.patchCompPrograms projPaths qeCompPrograms
+    _ -> qeCompPrograms
+  let ?cprogs = cprogs in
+    let ?progs = qePrograms in f
+  where
+    -- | Determine ghc-pkg path from ghc path
+    guessCompProgramPaths :: Verbose => CompPrograms -> IO CompPrograms
+    guessCompProgramPaths progs = do
+        let v | ?verbose  = deafening
+              | otherwise = silent
+            mGhcPath0    | same ghcProgram progs dprogs = Nothing
+                        | otherwise = Just $ ghcProgram progs
+            mGhcPkgPath0 | same ghcPkgProgram progs dprogs = Nothing
+                        | otherwise = Just $ ghcPkgProgram progs
+        (_compiler, _mplatform, progdb)
+            <- GHC.configure
+                  v
+                  mGhcPath0
+                  mGhcPkgPath0
+                  ProgDb.defaultProgramDb
+        let getProg p = ProgDb.programPath <$> ProgDb.lookupProgram p progdb
+            mghcPath1    = getProg ProgDb.ghcProgram
+            mghcPkgPath1 = getProg ProgDb.ghcPkgProgram
+        return progs
+          { ghcProgram    = fromMaybe (ghcProgram progs) mghcPath1
+          , ghcPkgProgram = fromMaybe (ghcProgram progs) mghcPkgPath1
+          }
+      where
+        same f o o'  = f o == f o'
+        dprogs = defaultCompPrograms
+
 getHelperExe
     :: ProjInfo pt -> QueryEnvI c pt -> IO FilePath
-getHelperExe proj_info QueryEnv{..} = do
-  withVerbosity $ do
+getHelperExe proj_info qe@QueryEnv{..} = do
+  withVerbosity $ withProgs (piImpl proj_info) qe $ do
     let comp = wrapper' qeProjLoc qeDistDir proj_info
     let ?progs = qePrograms
         ?cprogs = qeCompPrograms
@@ -641,21 +651,25 @@ wrapper'
     , cheDistV2 = Nothing
     }
 wrapper'
-  (ProjLocV2Dir projdir)
+  projloc
   (DistDirV2 distdir)
   ProjInfo{piImpl=ProjInfoV2{piV2Plan=plan}}
-  = CompHelperEnv
-    { cheCabalVer = CabalVersion $ makeDataVersion pjCabalLibVersion
-    , cheProjDir  = projdir
-    , cheProjLocalCacheDir = distdir </> "cache"
-    , chePkgDb    = Nothing
-    , chePlanJson = Just plan
-    , cheDistV2   = Just distdir
-    }
+  = case projloc of
+      ProjLocV2Dir projdir ->
+        let cheProjDir  = projdir in
+        CompHelperEnv {..}
+      ProjLocV2File proj_file ->
+        let cheProjDir = takeDirectory proj_file in
+        CompHelperEnv {..}
   where
+    cheCabalVer = CabalVersion $ makeDataVersion pjCabalLibVersion
+    cheProjLocalCacheDir = distdir </> "cache"
+    chePkgDb    = Nothing
+    chePlanJson = Just plan
+    cheDistV2   = Just distdir
     PlanJson {pjCabalLibVersion=Ver pjCabalLibVersion } = plan
 wrapper'
-  (ProjLocStackDir projdir)
+  (ProjLocStackYaml stack_yaml)
   (DistDirStack mworkdir)
   ProjInfo
     { piCabalVersion
@@ -665,6 +679,7 @@ wrapper'
       }
     }
   = let workdir = fromMaybe ".stack-work" $ unRelativePath <$> mworkdir in
+    let projdir = takeDirectory stack_yaml in
     CompHelperEnv
     { cheCabalVer = CabalVersion $ piCabalVersion
     , cheProjDir  = projdir
