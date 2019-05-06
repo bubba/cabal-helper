@@ -46,6 +46,8 @@ module Distribution.Helper (
   -- ** Unit queries
   , Unit -- abstract
   , uComponentName
+  , uCabalFile
+  , CabalFile(..)
   , UnitId -- abstract
   , UnitInfo(..)
   , unitInfo
